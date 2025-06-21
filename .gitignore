@@ -14,3 +14,12 @@ CLAUDE.md
 # Samply profile files
 profile.json.gz
 profile.json
+# Devenv
+.devenv*
+devenv.local.nix
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
