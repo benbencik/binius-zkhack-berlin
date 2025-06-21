@@ -21,6 +21,7 @@ use crate::{
 
 #[inline]
 pub fn packed_tower_16x8b_multiply(a: M128, b: M128) -> M128 {
+	println!("Hello from packed_tower_16x8b_multiply");
 	let loga = lookup_16x8b(TOWER_LOG_LOOKUP_TABLE, a).into();
 	let logb = lookup_16x8b(TOWER_LOG_LOOKUP_TABLE, b).into();
 	let logc = unsafe {
@@ -48,6 +49,7 @@ pub fn packed_tower_16x8b_invert_or_zero(x: M128) -> M128 {
 
 #[inline]
 pub fn packed_tower_16x8b_multiply_alpha(x: M128) -> M128 {
+	println!("Hello from packed_tower_16x8b_multiply_alpha");
 	lookup_16x8b(TOWER_MUL_ALPHA_LOOKUP_TABLE, x)
 }
 
@@ -66,6 +68,9 @@ pub fn packed_aes_16x8b_mul_alpha(x: M128) -> M128 {
 pub fn packed_aes_16x8b_multiply(a: M128, b: M128) -> M128 {
 	//! Performs a multiplication in GF(2^8) on the packed bytes.
 	//! See <https://doc.rust-lang.org/beta/core/arch/x86_64/fn._mm_gf2p8mul_epi8.html>
+
+	println!("Hello from `packed_aes_16x8b_multiply`");
+
 	unsafe {
 		let a = vreinterpretq_p8_p128(a.into());
 		let b = vreinterpretq_p8_p128(b.into());
