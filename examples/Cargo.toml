@@ -15,7 +15,9 @@ binius_fast_compute = { path = "../crates/fast_compute", default-features = fals
 binius_field = { path = "../crates/field", default-features = false }
 binius_hal = { path = "../crates/hal", default-features = false }
 binius_hash = { path = "../crates/hash", default-features = false }
-binius_m3 = { path = "../crates/m3", default-features = false, features = ["test_utils"] }
+binius_m3 = { path = "../crates/m3", default-features = false, features = [
+    "test_utils",
+] }
 binius_macros = { path = "../crates/macros", default-features = false }
 binius_math = { path = "../crates/math", default-features = false }
 binius_maybe_rayon = { path = "../crates/maybe_rayon", default-features = false }
@@ -68,6 +70,10 @@ harness = false
 
 [[bench]]
 name = "additive_ntt"
+harness = false
+
+[[bench]]
+name = "additive_ntt2"
 harness = false
 
 [[bench]]
