@@ -219,25 +219,26 @@ pub fn forward_transform<F: BinaryField, P: PackedField<Scalar = F>>(
 	for i in (0..cmp::min(cutoff, log_y - skip_rounds)).rev() {
 		let s_evals_i = &s_evals[i];
 		let coset_offset = coset << (log_y - 1 - i);
-
-		// A block is a block of butterfly units that all have the same twiddle factor. Since we
-		// are below the cutoff round, the block length is less than the packing width, and
-		// therefore each packed multiplication is with a non-uniform twiddle. Since the subspace
-		// polynomials are linear, we can calculate an additive factor that can be added to the
-		// packed twiddles for all packed butterfly units.
 		let block_twiddle = calculate_packed_additive_twiddle::<P>(s_evals_i, shape, i);
-
 		let log_block_len = i + log_x;
 		let log_packed_count = (log_y - 1).saturating_sub(cutoff);
-		for j in 0..1 << (log_x + log_y + log_z).saturating_sub(log_w + log_packed_count + 1) {
+		let packed_stride = 1 << (log_packed_count + 1);
+
+		// Optimized loop order: process consecutive elements first
+		for j_base in (0..1 << (log_x + log_y + log_z).saturating_sub(log_w + log_packed_count + 1))
+			.step_by(2)
+		{
 			for k in 0..1 << log_packed_count {
 				let twiddle =
 					P::broadcast(s_evals_i.get(coset_offset | k << (cutoff - i))) + block_twiddle;
-				let index = k << 1 | j << (log_packed_count + 1);
-				let (mut u, mut v) = data[index].interleave(data[index | 1], log_block_len);
-				u += v * twiddle;
-				v += u;
-				(data[index], data[index | 1]) = u.interleave(v, log_block_len);
+				let index = k << 1 | j_base;
+
+				if index + 1 < data.len() {
+					let (mut u, mut v) = data[index].interleave(data[index | 1], log_block_len);
+					u += v * twiddle;
+					v += u;
+					(data[index], data[index | 1]) = u.interleave(v, log_block_len);
+				}
 			}
 		}
 	}

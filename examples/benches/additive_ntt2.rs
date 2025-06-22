@@ -34,8 +34,6 @@ fn bench_large_transform<F: TowerField, PE: PackedExtension<F>>(field: &str) {
 	// 	b.iter(|| ntt.forward_transform_ext(&mut data, shape, 0, 0, 0));
 	// });
 
-	println!("yoooooo2");
-
 	let _ = ntt.forward_transform_ext(&mut data, shape, 0, 0, 0);
 
 	// println!("yeeet");
