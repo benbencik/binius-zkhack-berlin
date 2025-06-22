@@ -11,7 +11,9 @@ use super::{
 	error::Error,
 	twiddle::TwiddleAccess,
 };
-use crate::twiddle::{OnTheFlyTwiddleAccess, PrecomputedTwiddleAccess, expand_subspace_evals};
+use crate::twiddle::{
+	self, OnTheFlyTwiddleAccess, PrecomputedTwiddleAccess, expand_subspace_evals,
+};
 
 /// Implementation of `AdditiveNTT` that performs the computation single-threaded.
 #[derive(Debug)]
@@ -131,6 +133,9 @@ where
 	}
 }
 
+// ----------------------------------------------------------------------------------------------------------
+// Similar to https://github.com/starkware-libs/stwo/blob/dev/crates/prover/src/core/backend/simd/fft/rfft.rs
+//
 pub fn forward_transform<F: BinaryField, P: PackedField<Scalar = F>>(
 	log_domain_size: usize,
 	s_evals: &[impl TwiddleAccess<F>],
@@ -155,12 +160,6 @@ pub fn forward_transform<F: BinaryField, P: PackedField<Scalar = F>>(
 			return match P::LOG_WIDTH {
 				0 => Ok(()),
 				_ => {
-					// Special case when there is only one packed element: since we cannot
-					// interleave with another packed element, the code below will panic when there
-					// is only one.
-					//
-					// Handle the case of one packed element by batch transforming the original
-					// data with dummy data and extracting the transformed result.
 					let mut buffer = [data[0], P::zero()];
 					forward_transform(
 						log_domain_size,
@@ -184,65 +183,239 @@ pub fn forward_transform<F: BinaryField, P: PackedField<Scalar = F>>(
 		log_y,
 		log_z,
 	} = shape;
-
 	let log_w = P::LOG_WIDTH;
-
-	// Cutoff is the stage of the NTT where each the butterfly units are contained within
-	// packed base field elements.
 	let cutoff = log_w.saturating_sub(log_x);
-
-	// Choose the twiddle factors so that NTTs on differently sized domains, with the same
-	// coset_bits, share the beginning layer twiddles.
 	let s_evals = &s_evals[log_domain_size - (log_y + coset_bits)..];
 
-	// i indexes the layer of the NTT network, also the binary subspace.
+	// Process layers above cutoff with cache-blocking optimization
+	if log_y > skip_rounds {
+		forward_transform_above_cutoff(data, s_evals, shape, coset, cutoff, skip_rounds);
+	}
+
+	// Process layers below cutoff with packed operations
+	if cutoff > 0 {
+		forward_transform_below_cutoff(data, s_evals, shape, coset, cutoff, skip_rounds);
+	}
+
+	Ok(())
+}
+
+/// Optimized using cache-efficient blocking
+#[inline(always)]
+fn forward_transform_above_cutoff<F: BinaryField, P: PackedField<Scalar = F>>(
+	data: &mut [P],
+	s_evals: &[impl TwiddleAccess<F>],
+	shape: NTTShape,
+	coset: usize,
+	cutoff: usize,
+	skip_rounds: usize,
+) {
+	let NTTShape {
+		log_x,
+		log_y,
+		log_z,
+	} = shape;
+	let log_w = P::LOG_WIDTH;
+
+	// Cache block size - tune this based on your cache size
+	const CACHE_BLOCK_LOG_SIZE: usize = 6; // 64 elements per block
+
 	for i in (cutoff..(log_y - skip_rounds)).rev() {
 		let s_evals_i = &s_evals[i];
 		let coset_offset = coset << (log_y - 1 - i);
+		let stride = 1 << (log_x + i - log_w);
+		let num_blocks = 1 << (log_y - 1 - i);
+		let block_size = 1 << (i + log_x - log_w);
 
-		// j indexes the outer Z tensor axis.
-		for j in 0..1 << log_z {
-			// k indexes the block within the layer. Each block performs butterfly operations with
-			// the same twiddle factor.
-			for k in 0..1 << (log_y - 1 - i) {
-				let twiddle = s_evals_i.get(coset_offset | k);
-				for l in 0..1 << (i + log_x - log_w) {
-					let idx0 = j << (log_x + log_y - log_w) | k << (log_x + i + 1 - log_w) | l;
-					let idx1 = idx0 | 1 << (log_x + i - log_w);
-					data[idx0] += data[idx1] * twiddle;
-					data[idx1] += data[idx0];
+		if log_z + (log_y - 1 - i) + (i + log_x - log_w) >= CACHE_BLOCK_LOG_SIZE {
+			let outer_blocks = 1 << log_z;
+			let blocks_per_cache_block = 1 << CACHE_BLOCK_LOG_SIZE.min(log_y - 1 - i);
+
+			for outer_block in 0..outer_blocks {
+				let base_j = outer_block << (log_x + log_y - log_w);
+
+				for block_chunk_start in (0..num_blocks).step_by(blocks_per_cache_block) {
+					let block_chunk_end =
+						(block_chunk_start + blocks_per_cache_block).min(num_blocks);
+
+					// Prefetch twiddle factors for this chunk
+					let chunk_twiddles: Vec<_> = (block_chunk_start..block_chunk_end)
+						.map(|k| s_evals_i.get(coset_offset | k))
+						.collect();
+
+					// Process each block in the chunk
+					for (block_idx, &twiddle) in chunk_twiddles.iter().enumerate() {
+						let k = block_chunk_start + block_idx;
+						let block_base = base_j | (k << (log_x + i + 1 - log_w));
+
+						// Vectorized butterfly operations within the block
+						butterfly_block_simd(data, block_base, stride, block_size, twiddle);
+					}
 				}
+			}
+		} else {
+			// Fall back to simpler approach for smaller transforms
+			forward_transform_above_cutoff_simple(
+				data,
+				s_evals_i,
+				log_x,
+				log_y,
+				log_z,
+				log_w,
+				i,
+				coset_offset,
+			);
+		}
+	}
+}
+
+use std::arch::x86_64::*;
+#[target_feature(enable = "avx2")]
+unsafe fn butterfly_block_simd_u32(
+	data: *mut u32,
+	block_base: usize,
+	stride: usize,
+	block_size: usize,
+	twiddle: u32,
+) {
+	// Broadcast twiddle into all 8 lanes of a 256-bit register
+	let tw_vec = _mm256_set1_epi32(twiddle as i32);
+
+	unsafe {
+		let mut i = 0;
+		while i + 8 <= block_size {
+			let ptr0 = data.add(block_base + i) as *const __m256i;
+			let ptr1 = data.add(block_base + i + stride) as *const __m256i;
+
+			let u_vec = _mm256_loadu_si256(ptr0);
+			let v_vec = _mm256_loadu_si256(ptr1);
+
+			let v_mul = _mm256_mullo_epi32(v_vec, tw_vec);
+
+			let t0 = _mm256_add_epi32(u_vec, v_mul);
+
+			let t1 = _mm256_add_epi32(v_vec, t0);
+
+			_mm256_storeu_si256(data.add(block_base + i) as *mut __m256i, t0);
+			_mm256_storeu_si256(data.add(block_base + i + stride) as *mut __m256i, t1);
+
+			i += 8;
+		}
+
+		for j in i..block_size {
+			let p0 = data.add(block_base + j);
+			let p1 = data.add(block_base + j + stride);
+			let u = *p0;
+			let v = *p1;
+
+			let t0 = u.wrapping_add(v.wrapping_mul(twiddle));
+			*p0 = t0;
+			*p1 = v.wrapping_add(t0);
+		}
+	}
+}
+
+/// Safe wrapper for your `&mut [P]` slice—requires `P` to be `repr(transparent)` over `u32`.
+///! This does not work, the twiddle is hard-coded could not convert it to u32
+pub fn butterfly_block_simd<F: BinaryField, P: PackedField<Scalar = F>>(
+	data: &mut [P],
+	block_base: usize,
+	stride: usize,
+	block_size: usize,
+	twiddle: F,
+) where
+	P: Copy, // ensures no padding, repr(transparent)
+{
+	// cast `&mut [P]` → raw `*mut u32`
+	let ptr = data.as_mut_ptr() as *mut u32;
+
+	// We tried to hotfix this by casting coversion through string. In the end we could not pass the
+	// test let x = twiddle.to_string();
+	// let bytes = x.as_bytes();
+	// let twiddleu32 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+
+	debug_assert!(is_x86_feature_detected!("avx2"), "AVX2 required");
+	unsafe { butterfly_block_simd_u32(ptr, block_base, stride, block_size, 1) }
+}
+
+/// Simple version for smaller transforms
+#[inline(always)]
+fn forward_transform_above_cutoff_simple<F: BinaryField, P: PackedField<Scalar = F>>(
+	data: &mut [P],
+	s_evals_i: &impl TwiddleAccess<F>,
+	log_x: usize,
+	log_y: usize,
+	log_z: usize,
+	log_w: usize,
+	i: usize,
+	coset_offset: usize,
+) {
+	for j in 0..1 << log_z {
+		for k in 0..1 << (log_y - 1 - i) {
+			let twiddle = P::broadcast(s_evals_i.get(coset_offset | k));
+			for l in 0..1 << (i + log_x - log_w) {
+				let idx0 = j << (log_x + log_y - log_w) | k << (log_x + i + 1 - log_w) | l;
+				let idx1 = idx0 | 1 << (log_x + i - log_w);
+				data[idx0] += data[idx1] * twiddle;
+				data[idx1] += data[idx0];
 			}
 		}
 	}
+}
+
+/// Optimized transform for layers below cutoff with improved packed operations
+#[inline(always)]
+fn forward_transform_below_cutoff<F: BinaryField, P: PackedField<Scalar = F>>(
+	data: &mut [P],
+	s_evals: &[impl TwiddleAccess<F>],
+	shape: NTTShape,
+	coset: usize,
+	cutoff: usize,
+	skip_rounds: usize,
+) {
+	let NTTShape {
+		log_x,
+		log_y,
+		log_z,
+	} = shape;
+	let log_w = P::LOG_WIDTH;
 
 	for i in (0..cmp::min(cutoff, log_y - skip_rounds)).rev() {
 		let s_evals_i = &s_evals[i];
 		let coset_offset = coset << (log_y - 1 - i);
 
-		// A block is a block of butterfly units that all have the same twiddle factor. Since we
-		// are below the cutoff round, the block length is less than the packing width, and
-		// therefore each packed multiplication is with a non-uniform twiddle. Since the subspace
-		// polynomials are linear, we can calculate an additive factor that can be added to the
-		// packed twiddles for all packed butterfly units.
+		// Pre-calculate packed additive twiddle once per layer
 		let block_twiddle = calculate_packed_additive_twiddle::<P>(s_evals_i, shape, i);
 
 		let log_block_len = i + log_x;
 		let log_packed_count = (log_y - 1).saturating_sub(cutoff);
-		for j in 0..1 << (log_x + log_y + log_z).saturating_sub(log_w + log_packed_count + 1) {
-			for k in 0..1 << log_packed_count {
-				let twiddle =
-					P::broadcast(s_evals_i.get(coset_offset | k << (cutoff - i))) + block_twiddle;
-				let index = k << 1 | j << (log_packed_count + 1);
-				let (mut u, mut v) = data[index].interleave(data[index | 1], log_block_len);
-				u += v * twiddle;
-				v += u;
-				(data[index], data[index | 1]) = u.interleave(v, log_block_len);
+		let outer_count = 1 << (log_x + log_y + log_z).saturating_sub(log_w + log_packed_count + 1);
+		let packed_count = 1 << log_packed_count;
+
+		const OUTER_BLOCK_SIZE: usize = 64;
+
+		for j_block in (0..outer_count).step_by(OUTER_BLOCK_SIZE) {
+			let j_end = (j_block + OUTER_BLOCK_SIZE).min(outer_count);
+
+			let twiddles: Vec<_> = (0..packed_count)
+				.map(|k| {
+					P::broadcast(s_evals_i.get(coset_offset | k << (cutoff - i))) + block_twiddle
+				})
+				.collect();
+
+			for j in j_block..j_end {
+				for k in 0..packed_count {
+					let twiddle = twiddles[k];
+					let index = k << 1 | j << (log_packed_count + 1);
+
+					let (mut u, mut v) = data[index].interleave(data[index | 1], log_block_len);
+					u += v * twiddle;
+					v += u;
+					(data[index], data[index | 1]) = u.interleave(v, log_block_len);
+				}
 			}
 		}
 	}
-
-	Ok(())
 }
 
 pub fn inverse_transform<F: BinaryField, P: PackedField<Scalar = F>>(
