@@ -195,22 +195,27 @@ pub fn forward_transform<F: BinaryField, P: PackedField<Scalar = F>>(
 	// coset_bits, share the beginning layer twiddles.
 	let s_evals = &s_evals[log_domain_size - (log_y + coset_bits)..];
 
-	// i indexes the layer of the NTT network, also the binary subspace.
+	// 1. Optimize first loop with contiguous memory blocks
 	for i in (cutoff..(log_y - skip_rounds)).rev() {
 		let s_evals_i = &s_evals[i];
 		let coset_offset = coset << (log_y - 1 - i);
+		let butterfly_distance = 1 << (log_x + i - log_w);
+		let block_size = 1 << (i + log_x - log_w);
 
-		// j indexes the outer Z tensor axis.
 		for j in 0..1 << log_z {
-			// k indexes the block within the layer. Each block performs butterfly operations with
-			// the same twiddle factor.
 			for k in 0..1 << (log_y - 1 - i) {
 				let twiddle = s_evals_i.get(coset_offset | k);
-				for l in 0..1 << (i + log_x - log_w) {
-					let idx0 = j << (log_x + log_y - log_w) | k << (log_x + i + 1 - log_w) | l;
-					let idx1 = idx0 | 1 << (log_x + i - log_w);
-					data[idx0] += data[idx1] * twiddle;
-					data[idx1] += data[idx0];
+				let base_idx = j << (log_x + log_y - log_w) | k << (log_x + i + 1 - log_w);
+
+				// Process contiguous blocks of memory
+				let (left, right) = data.split_at_mut(base_idx + butterfly_distance);
+				let block0 = &mut left[base_idx..base_idx + block_size];
+				let block1 = &mut right[0..block_size];
+
+				// Process entire blocks sequentially
+				for idx in 0..block_size {
+					block0[idx] += block1[idx] * twiddle;
+					block1[idx] += block0[idx];
 				}
 			}
 		}
